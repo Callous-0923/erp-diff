@@ -1,0 +1,34 @@
+# Experiment outputs
+erpdiff_output_*/
+ablation_*/
+benchmark_results_*/
+graphify-out/
+_tmp_*/
+_tmp_*
+tmp_specs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Data files
+*.pkl
+*.log
+
+# Large binary / document files
+*.pdf
+*.pptx
+*.png
+*.jpg
+
+# LaTeX auxiliary files
+*.fdb_latexmk
+*.aux
+*.out
+*.synctex.gz
+
+# Local tool settings
+.claude/

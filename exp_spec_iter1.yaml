@@ -1,0 +1,6 @@
+ERPDIFF_EXPERIMENT_SPEC:
+  dataset: dataset2
+  loss:
+    focal:
+      alpha: 0.80
+      gamma: 2.0

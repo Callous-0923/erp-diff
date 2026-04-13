@@ -1,0 +1,346 @@
+% ============================================================
+% ERPDiff: Chapter 3 — Methodology
+% Target: Elsevier Q2 journal (e.g., Biomedical Signal Processing and Control)
+% ============================================================
+
+\section{Methodology}\label{sec:method}
+
+This section presents the proposed ERPDiff framework in detail. We first formalize the problem setting and notation in Section~\ref{sec:problem}. Section~\ref{sec:overview} provides an overview of the overall architecture. Sections~\ref{sec:clb}--\ref{sec:rbb} describe the dual-branch feature extraction design. Sections~\ref{sec:tdsa} and~\ref{sec:gdcm} elaborate on the two core attention modules. Finally, Sections~\ref{sec:fusion}--\ref{sec:training} present the dynamic fusion mechanism and the two-stage training strategy.
+
+% ============================================================
+\subsection{Problem formulation and notation}\label{sec:problem}
+
+In a P300-based brain--computer interface (BCI), the system records multi-channel electroencephalogram (EEG) signals while the user attends to a sequence of visual stimuli. Each stimulus presentation yields a single-trial EEG segment $\mathbf{X} \in \mathbb{R}^{C \times T}$, where $C$ is the number of electrodes and $T$ is the number of temporal samples within a post-stimulus window. The objective is to classify each trial as either a \emph{target} ($y = 1$, i.e., the stimulus containing the attended character, which evokes a P300 response) or a \emph{non-target} ($y = 0$). Due to the nature of oddball-type paradigms, non-target trials outnumber target trials by ratios ranging from 5:1 to 11:1, creating severe class imbalance.
+
+We denote the classification model as $f_\theta: \mathbb{R}^{C \times T} \rightarrow \mathbb{R}^2$, which maps a single-trial EEG segment to a two-dimensional logit vector. The predicted label is $\hat{y} = \arg\max f_\theta(\mathbf{X})$. Table~\ref{tab:notation} summarizes the key symbols used throughout this paper.
+
+\begin{table}[t]
+\centering
+\caption{Summary of key notation.}
+\label{tab:notation}
+\begin{tabular}{ll}
+\toprule
+Symbol & Description \\
+\midrule
+$\mathbf{X} \in \mathbb{R}^{C \times T}$ & Single-trial EEG segment \\
+$y \in \{0, 1\}$ & Trial label (non-target / target) \\
+$d$ & Embedding dimension of token representations (= 32) \\
+$T'$ & Number of temporal tokens after feature extraction \\
+$H$ & Number of attention heads (= 4) \\
+$d_h = d / H$ & Per-head dimension (= 8) \\
+$\lambda_{\text{init}}$ & Initial value of the differential attention coefficient \\
+$\alpha(t)$ & Dynamic fusion weight at training epoch $t$ \\
+$\lambda_{\text{intra}}$ & Weight for intra-branch auxiliary losses \\
+$\lambda_{\text{comp}}$ & Weight for complementarity preservation loss \\
+$m_{\text{comp}}$ & Margin for soft decorrelation \\
+$E_w$ & Number of warmup epochs with frozen stems \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================
+\subsection{Architecture overview}\label{sec:overview}
+
+Fig.~\ref{fig:overview} presents the overall architecture of ERPDiff. The framework consists of five main components: (1) a \emph{Classification Branch} (CLB) for global feature extraction, (2) a \emph{Re-balancing Branch} (RBB) for fine-grained temporal feature extraction with expanded receptive fields, (3) a \emph{Temporal Differential Self-Attention} (TDSA) module applied exclusively to the RBB tokens, (4) a \emph{Gated Differential Cross-Attention Module} (GDCM) for bidirectional information fusion between the two branches, and (5) a \emph{Dynamic Weighted Merging} (DWM) mechanism that combines the branch outputs into a final prediction.
+
+Given an input EEG segment $\mathbf{X} \in \mathbb{R}^{C \times T}$, the forward pass proceeds as follows:
+\begin{enumerate}
+    \item \textbf{Dual-branch feature extraction.} The input is independently processed by the CLB stem and the RBB stem, yielding feature maps $\mathbf{F}_{\text{clb}}, \mathbf{F}_{\text{rbb}} \in \mathbb{R}^{d \times 1 \times T'}$, where $d = 32$ is the channel dimension and $T'$ is the reduced temporal dimension.
+    \item \textbf{Tokenization.} Feature maps are reshaped into token sequences $\mathbf{Z}_{\text{clb}}, \mathbf{Z}_{\text{rbb}} \in \mathbb{R}^{T' \times d}$ by squeezing the spatial dimension and permuting.
+    \item \textbf{Temporal differential self-attention.} The RBB tokens are refined by the TDSA module: $\mathbf{Z}_{\text{rbb}} \leftarrow \text{TDSA}(\mathbf{Z}_{\text{rbb}})$.
+    \item \textbf{Gated differential cross-attention.} Both token sequences are updated through bidirectional cross-attention: $(\mathbf{Z}'_{\text{clb}}, \mathbf{Z}'_{\text{rbb}}) = \text{GDCM}(\mathbf{Z}_{\text{clb}}, \mathbf{Z}_{\text{rbb}})$.
+    \item \textbf{Classification and fusion.} Each branch's tokens are converted back to feature maps and passed through independent classification tails to produce logit vectors $\mathbf{o}_{\text{clb}}, \mathbf{o}_{\text{rbb}} \in \mathbb{R}^2$. The final prediction is the dynamically weighted sum:
+    \begin{equation}\label{eq:fusion}
+        \mathbf{o}_{\text{fused}} = \alpha \cdot \mathbf{o}_{\text{clb}} + (1 - \alpha) \cdot \mathbf{o}_{\text{rbb}},
+    \end{equation}
+    where $\alpha \in [0, 1]$ is a time-varying fusion coefficient described in Section~\ref{sec:fusion}.
+\end{enumerate}
+
+
+% ============================================================
+\subsection{Classification Branch (CLB)}\label{sec:clb}
+
+The CLB adopts the architecture of ICNN~\cite{santamaria2020icnn}, an Inception-based convolutional neural network specifically designed for ERP classification. The stem module processes the input through the following stages:
+
+\begin{enumerate}
+    \item \textbf{Temporal convolution.} A 1D convolution with kernel size $(1, 64)$ across the temporal dimension, followed by batch normalization (BN). This layer captures temporal patterns at the scale of approximately 500\,ms at a 128\,Hz sampling rate, corresponding to the typical latency range of the P300 component. The output has 8 feature maps.
+    \item \textbf{Depthwise spatial convolution.} A depthwise convolution with kernel size $(C, 1)$ and groups $= 8$, followed by BN. This layer learns spatial filters that combine electrode signals, analogous to a learned spatial filter in traditional ERP analysis. The output has 32 feature maps.
+    \item \textbf{Inception block \#1.} A four-branch Inception module with parallel pathways:
+    \begin{itemize}
+        \item Branch A: $1 \times 1$ convolution (8 filters),
+        \item Branch B: $1 \times 1$ reduction followed by temporal convolution with kernel size $(1, 16)$ (8 filters),
+        \item Branch C: $1 \times 1$ reduction followed by temporal convolution with kernel size $(1, 64)$ (8 filters),
+        \item Branch D: average pooling with kernel $(1, 7)$ followed by $1 \times 1$ convolution (8 filters).
+    \end{itemize}
+    The four branches are concatenated along the channel dimension, producing 32 feature maps. This multi-scale design captures temporal patterns at different resolutions simultaneously.
+    \item \textbf{Temporal downsampling.} Average pooling with kernel $(1, 4)$ and stride $(1, 4)$, followed by dropout ($p = 0.28$).
+    \item \textbf{Inception block \#2.} A second Inception module with smaller kernel sizes: branch B uses $(1, 8)$ and branch C uses $(1, 16)$, with a $(1, 3)$ pooling in branch D. This block refines the features at a coarser temporal scale.
+\end{enumerate}
+
+The output of the CLB stem is $\mathbf{F}_{\text{clb}} \in \mathbb{R}^{32 \times 1 \times T'}$, where $T' = \lfloor T / 4 \rfloor$ is the temporally downsampled dimension.
+
+During pretraining, the CLB is trained with a \emph{bias-variance-aware self-distillation} (BSD) strategy combined with cross-entropy loss, which is described in Section~\ref{sec:bsd}.
+
+
+% ============================================================
+\subsection{Re-balancing Branch (RBB)}\label{sec:rbb}
+
+The RBB shares the same macro-architecture as the CLB but introduces a critical modification: the third branch (Branch C) of Inception block \#1 employs a \emph{dilated temporal convolution} with kernel size $(1, 16)$ and dilation rate 4, replacing the standard convolution with kernel size $(1, 64)$ used in the CLB.
+
+The effective receptive field of the dilated convolution is:
+\begin{equation}\label{eq:dilated_rf}
+    k_{\text{eff}} = d \cdot (k - 1) + 1 = 4 \times (16 - 1) + 1 = 61 \text{ samples},
+\end{equation}
+which covers approximately 477\,ms at 128\,Hz, comparable to the 64-sample standard convolution in the CLB, but with the following advantages:
+\begin{itemize}
+    \item The dilated convolution uses only $k = 16$ kernel parameters instead of 64, reducing the parameter count of this branch by 75\% while maintaining a comparable receptive field.
+    \item The dilation introduces a structured sub-sampling pattern that captures temporal patterns at a coarser granularity. This design improves robustness to minor temporal jitter in ERP latencies, which is a well-documented source of inter-trial variability in P300-based BCIs~\cite{luck2014introduction}.
+\end{itemize}
+
+During pretraining, the RBB is trained with focal loss~\cite{lin2017focal} to improve its sensitivity to the minority target class, which complements the CLB's cross-entropy training and encourages the two branches to develop distinct representational strategies.
+
+
+% ============================================================
+\subsection{Temporal Differential Self-Attention (TDSA)}\label{sec:tdsa}
+
+The TDSA module is applied to the RBB token sequence $\mathbf{Z}_{\text{rbb}} \in \mathbb{R}^{B \times T' \times d}$ and is designed to enhance the model's ability to distinguish ERP-related temporal dynamics from background EEG noise. It extends the Differential Attention mechanism proposed by Ye et al.~\cite{ye2024differential} to the temporal modeling of EEG signals.
+
+\subsubsection{Motivation}
+
+Standard multi-head self-attention computes a single attention map per head, which assigns weights to all temporal positions without distinguishing between task-relevant ERP components and task-irrelevant ongoing neural activity. In EEG signals, the P300 response is a weak, deterministic component superimposed on a much stronger stochastic background. A single attention map must simultaneously model both components, which limits its ability to selectively focus on the ERP signal.
+
+The differential attention mechanism addresses this limitation by computing \emph{two} attention maps per head and subtracting one from the other. Intuitively, the primary attention map captures both the ERP-related and background temporal dependencies, while the secondary map primarily captures the background activity. The difference effectively suppresses the shared background noise, yielding an attention output that is more focused on the ERP-relevant temporal structure. This mechanism is conceptually analogous to the \emph{difference waveform} technique in classical ERP analysis, where the response to non-target stimuli is subtracted from the target response to isolate the P300 component.
+
+\subsubsection{Formulation}
+
+Given the input token sequence $\mathbf{Z} \in \mathbb{R}^{B \times T' \times d}$, the TDSA module first applies layer normalization:
+\begin{equation}
+    \tilde{\mathbf{Z}} = \text{LayerNorm}(\mathbf{Z}).
+\end{equation}
+
+The normalized tokens are projected into queries, keys, and values, each with \emph{doubled} dimensionality to accommodate the two attention sub-groups:
+\begin{equation}
+    \mathbf{Q} = \tilde{\mathbf{Z}} \mathbf{W}_Q, \quad
+    \mathbf{K} = \tilde{\mathbf{Z}} \mathbf{W}_K, \quad
+    \mathbf{V} = \tilde{\mathbf{Z}} \mathbf{W}_V,
+\end{equation}
+where $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V \in \mathbb{R}^{d \times 2d}$. These are reshaped into $H$ heads, each with dimension $2d_h$:
+\begin{equation}
+    \mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{B \times H \times T' \times 2d_h},
+\end{equation}
+and each head's queries and keys are split into two groups along the last dimension:
+\begin{equation}
+    \mathbf{Q}_1, \mathbf{Q}_2 = \text{split}(\mathbf{Q}, d_h), \quad
+    \mathbf{K}_1, \mathbf{K}_2 = \text{split}(\mathbf{K}, d_h).
+\end{equation}
+
+Two separate attention maps are computed:
+\begin{equation}\label{eq:dual_attn}
+    \mathbf{A}_1 = \text{softmax}\!\left(\frac{\mathbf{Q}_1 \mathbf{K}_1^\top}{\sqrt{d_h}}\right), \quad
+    \mathbf{A}_2 = \text{softmax}\!\left(\frac{\mathbf{Q}_2 \mathbf{K}_2^\top}{\sqrt{d_h}}\right).
+\end{equation}
+
+The \emph{differential coefficient} $\lambda$ controls the balance between the two attention maps and is computed as a learnable, data-dependent scalar:
+\begin{equation}\label{eq:lambda}
+    \lambda = \exp(\boldsymbol{\lambda}_{q_1}^\top \boldsymbol{\lambda}_{k_1}) - \exp(\boldsymbol{\lambda}_{q_2}^\top \boldsymbol{\lambda}_{k_2}) + \lambda_{\text{init}},
+\end{equation}
+where $\boldsymbol{\lambda}_{q_1}, \boldsymbol{\lambda}_{k_1}, \boldsymbol{\lambda}_{q_2}, \boldsymbol{\lambda}_{k_2} \in \mathbb{R}^{d_h}$ are learnable parameter vectors initialized to zero, and $\lambda_{\text{init}} = 0.8$ is a fixed initial value. This parameterization ensures that $\lambda$ starts near $\lambda_{\text{init}}$ at the beginning of training and can adaptively adjust during optimization.
+
+The differential attention output is:
+\begin{equation}\label{eq:diff_attn}
+    \mathbf{O}_{\text{diff}} = (\mathbf{A}_1 - \lambda \cdot \mathbf{A}_2) \, \mathbf{V}.
+\end{equation}
+
+To ensure numerical stability, the output undergoes per-head layer normalization and scaling:
+\begin{equation}
+    \hat{\mathbf{O}} = \text{HeadNorm}(\mathbf{O}_{\text{diff}}) \cdot (1 - \lambda_{\text{init}}),
+\end{equation}
+where HeadNorm applies layer normalization independently to each head's output, and the $(1 - \lambda_{\text{init}})$ factor compensates for the reduced magnitude caused by the subtraction operation.
+
+Finally, the multi-head outputs are concatenated, projected, and combined with a residual connection:
+\begin{equation}\label{eq:tdsa_output}
+    \text{TDSA}(\mathbf{Z}) = \mathbf{Z} + \text{Dropout}\!\left(\text{Concat}(\hat{\mathbf{O}}_1, \dots, \hat{\mathbf{O}}_H) \, \mathbf{W}_O\right),
+\end{equation}
+where $\mathbf{W}_O \in \mathbb{R}^{2d \times d}$ is the output projection matrix. The residual connection preserves the original token information while adding the differentially-attended features.
+
+
+% ============================================================
+\subsection{Gated Differential Cross-Attention Module (GDCM)}\label{sec:gdcm}
+
+After independent feature extraction and temporal refinement, the CLB and RBB branches contain complementary information: the CLB captures global discriminative features via cross-entropy training, while the RBB emphasizes fine-grained temporal patterns of the minority class via focal loss and dilated convolutions. The GDCM fuses these two representations through bidirectional differential cross-attention with an adaptive gating mechanism.
+
+\subsubsection{Bidirectional differential cross-attention}
+
+The GDCM consists of two symmetric cross-attention paths operating in parallel:
+\begin{itemize}
+    \item \textbf{CLB $\leftarrow$ RBB path}: enriches CLB tokens using information from the RBB, with queries from $\mathbf{Z}_{\text{clb}}$ and keys/values from $\mathbf{Z}_{\text{rbb}}$.
+    \item \textbf{RBB $\leftarrow$ CLB path}: enriches RBB tokens using information from the CLB, with queries from $\mathbf{Z}_{\text{rbb}}$ and keys/values from $\mathbf{Z}_{\text{clb}}$.
+\end{itemize}
+
+Each path follows the same differential attention formulation as Eqs.~\eqref{eq:dual_attn}--\eqref{eq:diff_attn}, except that the queries and keys/values originate from different branches. Taking the CLB $\leftarrow$ RBB path as an example:
+\begin{equation}
+    \tilde{\mathbf{Z}}_q = \text{LN}_q(\mathbf{Z}_{\text{clb}}), \quad
+    \tilde{\mathbf{Z}}_{kv} = \text{LN}_{kv}(\mathbf{Z}_{\text{rbb}}),
+\end{equation}
+\begin{equation}
+    \mathbf{Q} = \tilde{\mathbf{Z}}_q \mathbf{W}_Q^{\text{cross}}, \quad
+    \mathbf{K} = \tilde{\mathbf{Z}}_{kv} \mathbf{W}_K^{\text{cross}}, \quad
+    \mathbf{V} = \tilde{\mathbf{Z}}_{kv} \mathbf{W}_V^{\text{cross}},
+\end{equation}
+where $\text{LN}_q$ and $\text{LN}_{kv}$ are separate layer normalization modules for the query and key-value sources, respectively. The differential attention, head normalization, output projection, and residual connection then proceed identically to Eqs.~\eqref{eq:dual_attn}--\eqref{eq:tdsa_output}.
+
+Applying the differential mechanism in the cross-attention setting enables selective information transfer: each branch attends to the most complementary features of the other branch while suppressing redundant or noisy cross-branch correlations.
+
+\subsubsection{Alpha gating mechanism}
+
+To prevent over-fusion in early training epochs when the cross-attention parameters are not yet well-calibrated, we introduce an \emph{alpha gating} mechanism that modulates the effective contribution of the cross-attention output. Specifically, the effective cross-attention residual is scaled by a gate value $g$ derived from the training-stage fusion coefficient $\alpha$:
+\begin{equation}\label{eq:alpha_gate}
+    g = \max(\alpha, \, g_{\min}),
+\end{equation}
+where $g_{\min} = 0.1$ is a floor value that prevents the gate from completely shutting off the cross-attention path, which would cause gradient starvation in the cross-attention parameters. The gated update for the CLB branch is:
+\begin{equation}
+    \mathbf{Z}'_{\text{clb}} = \mathbf{Z}_{\text{clb}} + g \cdot \text{CrossDiffAttn}(\mathbf{Z}_{\text{clb}}, \mathbf{Z}_{\text{rbb}}),
+\end{equation}
+and symmetrically for the RBB branch. Early in training, when $\alpha$ is close to 1 (favoring the CLB), the gate ensures full information flow. As training progresses and $\alpha$ decreases, the gate value decreases proportionally but never drops below $g_{\min}$.
+
+
+% ============================================================
+\subsection{Dynamic Weighted Merging (DWM)}\label{sec:fusion}
+
+After the GDCM, the updated token sequences $\mathbf{Z}'_{\text{clb}}$ and $\mathbf{Z}'_{\text{rbb}}$ are reshaped back to feature maps and passed through their respective classification tails, each comprising average pooling, a fully connected layer with BN and ReLU activation (8 hidden units), dropout, and a final linear projection to the two-class output:
+\begin{equation}
+    \mathbf{o}_{\text{clb}} = \text{Tail}_{\text{clb}}(\mathbf{Z}'_{\text{clb}}), \quad
+    \mathbf{o}_{\text{rbb}} = \text{Tail}_{\text{rbb}}(\mathbf{Z}'_{\text{rbb}}).
+\end{equation}
+
+The fused logit is computed according to Eq.~\eqref{eq:fusion}, where the fusion coefficient follows a quadratic annealing schedule during training:
+\begin{equation}\label{eq:alpha_schedule}
+    \alpha(t) = 1 - \left(\frac{t}{T_{\max}}\right)^2,
+\end{equation}
+where $t$ is the current epoch and $T_{\max}$ is the total number of training epochs. This schedule assigns higher weight to the CLB in the early training phase and gradually shifts the balance toward the RBB. The rationale is that the CLB, pretrained with standard cross-entropy loss, provides more stable gradients in the early training, while the RBB's fine-grained temporal features become increasingly reliable as training progresses.
+
+At evaluation time, the fusion coefficient is fixed at $\alpha_{\text{eval}} = 0.5$, giving equal weight to both branches.
+
+
+% ============================================================
+\subsection{Loss function design}\label{sec:loss}
+
+The training objectives are designed to achieve three goals: (1) accurate classification from the fused prediction, (2) preservation of each branch's individual discriminative ability, and (3) prevention of representational collapse between the two branches.
+
+\subsubsection{Fused classification loss}
+
+The primary loss is the cross-entropy loss computed on the fused logits:
+\begin{equation}
+    \mathcal{L}_{\text{fused}} = \text{CE}(\mathbf{o}_{\text{fused}}, y).
+\end{equation}
+
+\subsubsection{Intra-branch auxiliary losses}
+
+To prevent branch degradation during finetuning, we add auxiliary cross-entropy losses on each branch's individual outputs:
+\begin{equation}
+    \mathcal{L}_{\text{aux}} = \lambda_{\text{intra}} \cdot \left[\text{CE}(\mathbf{o}_{\text{clb}}, y) + \text{CE}(\mathbf{o}_{\text{rbb}}, y)\right],
+\end{equation}
+where $\lambda_{\text{intra}} = 0.2$ is the auxiliary loss weight. These losses ensure that both branches maintain standalone classification capability even as they learn to cooperate through the GDCM.
+
+\subsubsection{Complementarity preservation loss}
+
+The GDCM enables bidirectional information exchange between branches, which risks making their representations increasingly similar—ultimately collapsing into a single effective branch. To counteract this, we introduce a \emph{margin-based soft decorrelation loss} that penalizes excessive similarity between the branch representations:
+\begin{equation}\label{eq:comp_loss}
+    \mathcal{L}_{\text{comp}} = \lambda_{\text{comp}} \cdot \text{ReLU}\!\left(\text{cos\_sim}(\bar{\mathbf{z}}_{\text{clb}}, \bar{\mathbf{z}}_{\text{rbb}}) - m_{\text{comp}}\right),
+\end{equation}
+where $\bar{\mathbf{z}}_{\text{clb}} = \frac{1}{T'}\sum_{t=1}^{T'} \mathbf{z}_{\text{clb}}^{(t)}$ is the temporally averaged CLB token representation, and similarly for $\bar{\mathbf{z}}_{\text{rbb}}$. The margin $m_{\text{comp}} = 0.5$ allows the branches to share basic EEG features (their cosine similarity may be as high as 0.5 without penalty) while discouraging excessive convergence. The loss activates only when the similarity exceeds the margin, providing a soft constraint that does not interfere with normal training dynamics.
+
+\subsubsection{Total loss}
+
+The total fine-tuning loss combines all three components:
+\begin{equation}\label{eq:total_loss}
+    \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{fused}} + \mathcal{L}_{\text{aux}} + \mathcal{L}_{\text{comp}},
+\end{equation}
+where we set $\lambda_{\text{intra}} = 0.2$ and $\lambda_{\text{comp}} = 0.1$ in all experiments.
+
+
+% ============================================================
+\subsection{Two-stage training strategy}\label{sec:training}
+
+The training procedure consists of two stages: a cross-subject pretraining stage and a subject-specific finetuning stage with progressive unfreezing. This design leverages the shared neural patterns across subjects while preserving adaptability to individual brain characteristics.
+
+\subsubsection{Stage 1: Cross-subject pretraining}\label{sec:pretrain}
+
+In the first stage, the CLB and RBB are pretrained independently on pooled data from all subjects. This stage aims to learn general ERP-discriminative features that transfer across individuals.
+
+\paragraph{CLB pretraining with BSD.}
+The CLB is trained using a combination of standard cross-entropy loss and \emph{bias-variance-aware self-distillation} (BSD). For each training batch, we generate two augmented views of each sample:
+\begin{itemize}
+    \item \textbf{Weak augmentation} $\mathcal{T}_w$: Gaussian noise ($\sigma = 0.02 \cdot \hat{\sigma}_x$, where $\hat{\sigma}_x$ is the per-sample standard deviation), random time shift ($\pm 2$ samples), and amplitude scaling (uniformly sampled from $[0.95, 1.05]$).
+    \item \textbf{Strong augmentation} $\mathcal{T}_s$: Gaussian noise ($\sigma = 0.08 \cdot \hat{\sigma}_x$), random time shift ($\pm 6$ samples), amplitude scaling ($[0.80, 1.20]$), time masking (10\% of the temporal dimension zeroed), and channel dropout (each channel independently dropped with probability 0.10).
+\end{itemize}
+
+The BSD loss encourages the model to produce consistent predictions across the two views by minimizing the KL divergence between the weakly-augmented teacher output (detached from the computational graph) and the strongly-augmented student output:
+\begin{equation}\label{eq:bsd}
+    \mathcal{L}_{\text{BSD}} = \sum_{i} w_i \cdot \text{KL}\!\left(\text{softmax}\!\left(\frac{f_\theta(\mathcal{T}_w(\mathbf{X}_i))}{\tau}\right) \,\Big\|\, \text{softmax}\!\left(\frac{f_\theta(\mathcal{T}_s(\mathbf{X}_i))}{\tau}\right)\right) \cdot \tau^2,
+\end{equation}
+where $\tau = 2.0$ is the temperature parameter and $w_i$ is a class-dependent weight: $w_i = 1.0$ for non-target samples ($y_i = 0$) and $w_i = \rho = 0.3$ for target samples ($y_i = 1$). This asymmetric weighting prioritizes consistency on the majority class, preventing the self-distillation from reinforcing overconfident predictions on the few target samples.
+
+The total CLB pretraining loss is:
+\begin{equation}
+    \mathcal{L}_{\text{CLB}} = \text{CE}(f_\theta(\mathcal{T}_s(\mathbf{X})), y) + \beta \cdot \mathcal{L}_{\text{BSD}},
+\end{equation}
+where $\beta = 0.5$ is the BSD loss weight.
+
+\paragraph{RBB pretraining with focal loss.}
+The RBB is trained with focal loss~\cite{lin2017focal} to address class imbalance:
+\begin{equation}\label{eq:focal}
+    \mathcal{L}_{\text{FL}} = -\alpha_t \, (1 - p_t)^\gamma \, \log(p_t),
+\end{equation}
+where $p_t$ is the predicted probability of the correct class, $\gamma = 2.0$ is the focusing parameter, and $\alpha_t$ is the class-dependent weighting factor with $\alpha_1 = 0.75$ for the target (minority) class and $\alpha_0 = 0.25$ for the non-target (majority) class. By assigning 3$\times$ weight to the minority class and down-weighting easy examples via $(1 - p_t)^\gamma$, the focal loss encourages the RBB to develop stronger sensitivity to target trials.
+
+Both branches are optimized with Adam~\cite{kingma2015adam} ($\beta_1 = 0.9$, $\beta_2 = 0.999$) and a cosine annealing learning rate schedule with initial learning rate $\eta_0 = 0.001$ and minimum learning rate $\eta_{\min} = 0.1 \eta_0$. Weight decay is set to $5 \times 10^{-4}$. Early stopping with patience 15 (on validation loss) is applied to prevent overfitting.
+
+
+\subsubsection{Stage 2: Subject-specific finetuning with progressive unfreezing}\label{sec:finetune}
+
+In the second stage, the pretrained branch weights are loaded into the full ERPDiff model, and the model is finetuned independently for each subject. This stage employs a \emph{progressive unfreezing} strategy to prevent catastrophic forgetting of the pretrained representations:
+
+\begin{enumerate}
+    \item \textbf{Warmup phase (epochs $1$ to $E_w$).} The stem modules (temporal, spatial, and Inception layers) of both branches and the TDSA module are \emph{frozen}. Only the classification tails and the GDCM are trainable. This allows the GDCM to learn meaningful cross-branch fusion patterns before the stem features begin to shift. The default warmup duration is $E_w = 10$ epochs.
+    \item \textbf{Full training phase (epochs $E_w + 1$ to $T_{\max}$).} All parameters are unfrozen and jointly optimized. The stems are allowed to adapt to the subject-specific characteristics while the GDCM maintains its learned fusion strategy.
+\end{enumerate}
+
+The optimizer is Adam with learning rate $\eta_0 = 0.001$, weight decay $5 \times 10^{-4}$, and cosine annealing scheduler. Early stopping (patience 15) is applied based on validation loss. The total loss is given by Eq.~\eqref{eq:total_loss}, with the dynamic fusion coefficient $\alpha(t)$ following Eq.~\eqref{eq:alpha_schedule}.
+
+\subsubsection{Data splitting}
+
+For each subject, the available trials are split at the epoch level (not at the individual trial level) using an 80/20 train-test split. Within the training set, 20\% of the training epochs are held out as a validation set, resulting in an effective 64/16/20 split ratio. The same random seed ($= 42$) is used across all methods and runs to ensure comparable splits.
+
+Algorithm~\ref{alg:erpdiff} summarizes the complete two-stage training pipeline.
+
+\begin{algorithm}[t]
+\caption{ERPDiff two-stage training pipeline.}
+\label{alg:erpdiff}
+\begin{algorithmic}[1]
+\REQUIRE Preprocessed EEG data for all subjects $\{(\mathbf{X}_s, y_s)\}_{s=1}^{S}$
+\ENSURE Trained ERPDiff model $f_{\theta_s}^*$ for each subject $s$
+
+\STATE \textbf{Stage 1: Cross-subject pretraining}
+\STATE Pool training data from all subjects: $\mathcal{D}_{\text{pool}} = \bigcup_{s=1}^{S} \mathcal{D}_s^{\text{train}}$
+\STATE Train CLB with $\mathcal{L}_{\text{CLB}} = \text{CE} + \beta \cdot \mathcal{L}_{\text{BSD}}$ $\rightarrow$ save $\theta_{\text{CLB}}^*$
+\STATE Train RBB with $\mathcal{L}_{\text{FL}}$ (focal loss) $\rightarrow$ save $\theta_{\text{RBB}}^*$
+
+\STATE \textbf{Stage 2: Subject-specific finetuning}
+\FOR{each subject $s = 1, \dots, S$}
+    \STATE Initialize ERPDiff with $\theta_{\text{CLB}}^*$ and $\theta_{\text{RBB}}^*$
+    \STATE Freeze stems and TDSA; train only tails and GDCM
+    \FOR{epoch $t = 1, \dots, T_{\max}$}
+        \IF{$t = E_w + 1$}
+            \STATE Unfreeze all parameters \COMMENT{progressive unfreezing}
+        \ENDIF
+        \STATE Compute $\alpha(t) = 1 - (t / T_{\max})^2$
+        \STATE Compute $\mathcal{L}_{\text{total}}$ (Eq.~\ref{eq:total_loss})
+        \STATE Update $\theta$ with Adam; step cosine scheduler
+        \STATE Evaluate on $\mathcal{D}_s^{\text{val}}$; save best model by validation loss
+    \ENDFOR
+    \STATE Evaluate best model on $\mathcal{D}_s^{\text{test}}$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}

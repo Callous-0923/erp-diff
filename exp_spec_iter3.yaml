@@ -1,0 +1,16 @@
+ERPDIFF_EXPERIMENT_SPEC:
+  dataset: dataset2
+  table2_hyperparams:
+    pretrain:
+      batch_size: 256
+      initial_lr: 0.002
+      weight_decay: 0.0005
+    finetune:
+      batch_size: 64
+      initial_lr: 0.0012
+      weight_decay: 0.0005
+    epochs: 200
+  loss:
+    focal:
+      alpha: 0.80
+      gamma: 2.0

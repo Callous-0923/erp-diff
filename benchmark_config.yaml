@@ -1,0 +1,89 @@
+# ============================================================
+# ERPDiff vs. Baselines — Benchmark Configuration
+# ============================================================
+
+# Datasets
+datasets:
+  dataset1:
+    path: "D:\\files\\datasets\\erp-dataset1_preprocessed"
+    has_command_acc: false  # Dataset1 is RSVP, no 5D structure for command acc
+  dataset2:
+    path: "D:\\files\\codes\\EEGInception\\PreData_MOCNN"
+    has_command_acc: true
+  dataset3:
+    path: "D:\\files\\datasets\\BCI_Comp_III_Wads_2004_preprocessed"
+    has_command_acc: true
+
+# Baseline models to compare
+baseline_models:
+  - eegnet
+  - eeginception
+  - mocnn
+  - ppnn
+  - hcann
+  - tsformer-sa
+  - transformer
+  - multi-transformer
+  - icnn
+  - eeg-dbnet-v2
+
+# Protocols to run for baselines
+protocols:
+  - B1        # Standard training (CE + single model)
+  - B2-Full   # Enhanced (FocalLoss + ensemble + TTA + threshold opt)
+
+# Reproducibility
+seeds: [42, 43, 44]
+
+# Data split
+train_ratio: 0.8
+val_ratio_in_train: 0.2
+
+# ---- Protocol B1 (standard baseline) ----
+b1:
+  optimizer: adam
+  lr: 0.001
+  batch_size: 512
+  epochs: 500
+  patience: 20
+  loss: cross_entropy  # with class weights
+
+# ---- Protocol B2 (enhanced baseline) ----
+b2:
+  optimizer: adam
+  lr: 0.001
+  batch_size: 512
+  epochs: 500
+  patience: 20
+  loss: focal
+  focal_alpha: 0.70
+  focal_gamma: 2.0
+  ensemble_top_k: 5
+  tta_n_augments: 20
+  threshold_metric: balanced_acc
+
+# ---- ERPDiff ----
+erpdiff:
+  pretrain_batch_size: 128
+  finetune_batch_size: 64
+  pretrain_lr: 0.001
+  finetune_lr: 0.001
+  pretrain_epochs: 100
+  finetune_epochs: 300
+  pretrain_patience: 14
+  finetune_patience: 35
+  warmup_epochs: 10
+  focal_alpha: 0.70
+  focal_gamma: 2.0
+  lambda_intra: 0.05
+  lambda_comp: 0.1
+  comp_margin: 0.5
+  mixup_alpha: 0.4
+  ensemble_top_k: 5
+  tta_n_augments: 20
+
+# Output directory
+output_dir: "benchmark_results"
+
+# Command accuracy max k
+command_acc_max_k: 15
